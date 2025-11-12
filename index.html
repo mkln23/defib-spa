@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Simple WebSocket Viewer</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto,
+          "Helvetica Neue", Arial;
+        margin: 0;
+        padding: 16px;
+        background: #f6f8fb;
+        color: #111;
+      }
+      .card {
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 6px 18px rgba(20, 30, 50, 0.08);
+        padding: 14px;
+        max-width: 980px;
+        margin: 12px auto;
+      }
+      #endpoint
+      {
+        display: none;
+      }
+      header {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        justify-content: space-between;
+      }
+      input[type="text"] {
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid #d5dbe8;
+        width: 60%;
+      }
+      button {
+        padding: 8px 12px;
+        border-radius: 8px;
+        border: 0;
+        background: #2563eb;
+        color: #fff;
+        cursor: pointer;
+      }
+      button.ghost {
+        background: #eef3ff;
+        color: #2563eb;
+        border: 1px solid #dbeafe;
+      }
+      .status {
+        font-weight: 600;
+      }
+      .log {
+        height: 420px;
+        overflow: auto;
+        border-radius: 8px;
+        border: 1px solid #e6eefc;
+        padding: 10px;
+        background: #fbfdff;
+        margin-top: 12px;
+        font-family: monospace;
+        font-size: 13px;
+      }
+      .msg {
+        padding: 8px;
+        border-radius: 6px;
+        margin-bottom: 8px;
+        border-left: 4px solid #e6eefc;
+        background: #fff;
+      }
+      .msg.in {
+        border-left-color: #10b981;
+      }
+      .msg.out {
+        border-left-color: #2563eb;
+      }
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-top: 12px;
+      }
+      textarea {
+        width: 100%;
+        height: 72px;
+        padding: 8px;
+        border-radius: 8px;
+        border: 1px solid #d5dbe8;
+        font-family: monospace;
+      }
+      .meta {
+        color: #6b7280;
+        font-size: 13px;
+      }
+      .small {
+        font-size: 12px;
+        color: #6b7280;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <header>
+        <div style="display: flex; align-items: center; gap: 12px">
+          <div>
+            <strong>WebSocket Viewer</strong>
+            <div class="small">
+              For non-devs: paste endpoint, click Connect, watch messages live
+            </div>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 8px; align-items: center">
+          <span class="meta small"
+            >Status: <span id="status" class="status">disconnected</span></span
+          >
+          <button id="copyBtn" class="ghost">Copy log</button>
+          <button id="clearBtn" class="ghost">Clear</button>
+        </div>
+      </header>
+
+      <div
+        style="margin-top: 12px; display: flex; gap: 8px; align-items: center"
+      >
+        <input
+          id="endpoint"
+          type="text"
+          placeholder="wss://your-server.example/ws or ws://..."
+          value=""
+        />
+        <button id="connectBtn">Connect</button>
+        <button id="disconnectBtn" class="ghost" disabled>Disconnect</button>
+      </div>
+
+      <div class="log" id="log" role="log" aria-live="polite"></div>
+
+      <div class="controls">
+        <textarea
+          id="outgoing"
+          placeholder="Type a message to send (optional). Use valid JSON if needed."
+        ></textarea>
+        <div
+          style="width: 160px; display: flex; flex-direction: column; gap: 8px"
+        >
+          <button id="sendBtn">Send</button>
+          <div class="small">
+            Auto-reconnect:
+            <label><input id="reconn" type="checkbox" checked /> on</label>
+          </div>
+          <div class="small" id="lastPing">Last ping: —</div>
+        </div>
+      </div>
+
+      <div class="small" style="margin-top: 10px; color: #374151">
+        Notes: If your endpoint uses <code>wss://</code> it's secure. If using
+        <code>ws://</code> and you host this page on an HTTPS site, the browser
+        will block the connection — open the file locally or use HTTP hosting.
+        Don't paste secrets if you don't want them shared.
+      </div>
+    </div>
+
+    <script>
+      const endpointEl = document.getElementById("endpoint");
+      const connectBtn = document.getElementById("connectBtn");
+      const disconnectBtn = document.getElementById("disconnectBtn");
+      const statusEl = document.getElementById("status");
+      const logEl = document.getElementById("log");
+      const sendBtn = document.getElementById("sendBtn");
+      const outgoingEl = document.getElementById("outgoing");
+      const copyBtn = document.getElementById("copyBtn");
+      const clearBtn = document.getElementById("clearBtn");
+      const lastPing = document.getElementById("lastPing");
+      const reconnChk = document.getElementById("reconn");
+
+      let ws = null;
+      let reconnectDelay = 2000;
+      let shouldReconnect = true;
+
+      function addLog(text, type = "in") {
+        const time = new Date().toLocaleTimeString();
+        const el = document.createElement("div");
+        el.className = "msg " + (type === "out" ? "out" : "in");
+        // try pretty JSON
+        let pretty = text;
+        try {
+          const parsed = JSON.parse(text);
+          pretty = JSON.stringify(parsed, null, 2);
+          el.innerHTML = `<div class="meta">${time} · ${
+            type === "out" ? "SENT" : "RECV"
+          }</div><pre>${escapeHtml(pretty)}</pre>`;
+        } catch (e) {
+          el.innerHTML = `<div class="meta">${time} · ${
+            type === "out" ? "SENT" : "RECV"
+          }</div><pre>${escapeHtml(text)}</pre>`;
+        }
+        logEl.prepend(el);
+        // cap items
+        while (logEl.childElementCount > 200)
+          logEl.removeChild(logEl.lastChild);
+      }
+
+      function escapeHtml(s) {
+        return s
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+
+      function setStatus(s) {
+        statusEl.textContent = s;
+        const col =
+          { connected: "green", connecting: "orange", disconnected: "red" }[
+            s
+          ] || "#111";
+        statusEl.style.color = col;
+      }
+
+      function connect() {
+        const url = endpointEl.value.trim();
+        if (!url) {
+          alert("Please enter the WebSocket endpoint (ws:// or wss://)");
+          return;
+        }
+        shouldReconnect = true;
+        setStatus("connecting");
+        try {
+          ws = new WebSocket(url);
+        } catch (err) {
+          addLog("Invalid URL or blocked by browser: " + err.message, "in");
+          setStatus("disconnected");
+          return;
+        }
+        ws.addEventListener("open", () => {
+          setStatus("connected");
+          connectBtn.disabled = true;
+          disconnectBtn.disabled = false;
+          addLog("Connected to " + url, "in");
+        });
+        ws.addEventListener("message", (ev) => {
+          addLog(typeof ev.data === "string" ? ev.data : "[binary data]", "in");
+          lastPing.textContent =
+            "Last ping: " + new Date().toLocaleTimeString();
+        });
+        ws.addEventListener("error", (ev) => {
+          addLog("WebSocket error (check endpoint / network).", "in");
+        });
+        ws.addEventListener("close", (ev) => {
+          setStatus("disconnected");
+          connectBtn.disabled = false;
+          disconnectBtn.disabled = true;
+          addLog("Disconnected (code: " + ev.code + ")", "in");
+          if (shouldReconnect && reconnChk.checked) {
+            setTimeout(() => {
+              addLog("Attempting reconnect...", "in");
+              connect();
+            }, reconnectDelay);
+          }
+        });
+      }
+
+      function disconnect() {
+        shouldReconnect = false;
+        if (ws) ws.close(1000, "user disconnect");
+        setStatus("disconnected");
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+      }
+
+      connectBtn.addEventListener("click", connect);
+      disconnectBtn.addEventListener("click", disconnect);
+
+      sendBtn.addEventListener("click", () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          alert("Socket not connected");
+          return;
+        }
+        const msg = outgoingEl.value;
+        if (!msg) return;
+        try {
+          ws.send(msg);
+          addLog(msg, "out");
+          outgoingEl.value = "";
+        } catch (e) {
+          addLog("Failed to send: " + e.message, "in");
+        }
+      });
+
+      copyBtn.addEventListener("click", async () => {
+        // collect visible log text
+        const text = Array.from(logEl.querySelectorAll("pre"))
+          .map((p) => p.textContent)
+          .join("\n\n---\n\n");
+        try {
+          await navigator.clipboard.writeText(text || "");
+          alert("Log copied to clipboard");
+        } catch (e) {
+          alert("Copy failed: " + e.message);
+        }
+      });
+
+      clearBtn.addEventListener("click", () => (logEl.innerHTML = ""));
+
+      // quick connect on Enter if endpoint focused
+      endpointEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") connect();
+      });
+
+      // helpful: prefill common protocols hint (optional)
+      // endpointEl.value = 'wss://example.com/ws';
+      const AUTO_CONNECT_URL = "wss://eh8mwedjej.execute-api.us-east-1.amazonaws.com/dev/"; // <-- put your actual endpoint
+
+      window.addEventListener("load", () => {
+        endpointEl.value = AUTO_CONNECT_URL;
+        connect(); // trigger connection automatically
+      });
+    </script>
+  </body>
+</html>
